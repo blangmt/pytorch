@@ -1,11 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+import contextlib
 import tempfile
 
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import (
     DeviceMesh,
     distribute_module,
@@ -16,8 +18,13 @@ from torch.distributed.tensor import (
     Shard,
 )
 from torch.distributed.tensor.debug import CommDebugMode
-from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+)
 from torch.testing._internal.distributed._tensor.common_dtensor import (
+    DTensorContinuousTestBase,
     DTensorTestBase,
     with_comms,
 )
@@ -120,7 +127,7 @@ class DTensorAPITest(DTensorTestBase):
             distribute_tensor(tensor_to_distribute, device_mesh, shard_spec)
 
         with self.assertRaisesRegex(RuntimeError, "distribute leaf tensor"):
-            shard_spec = [Shard(0)]
+            shard_spec = [Shard(0), Shard(0)]
             global_tensor = torch.randn(*tensor_shape, requires_grad=True)
             global_tensor_to_distribute = global_tensor + 2
             distribute_tensor(global_tensor_to_distribute, device_mesh, shard_spec)
@@ -386,6 +393,203 @@ class DTensorAPITest(DTensorTestBase):
             "Any checkpointing related operations are not supported for",
         ):
             dcp.save({"fqn": dtensor}, checkpoint_id=tempfile.mkdtemp())
+
+
+class DTensorDeviceOrderAPITest(DTensorContinuousTestBase):
+    world_size = 4
+
+    @property
+    def device(self):
+        return f"{DTensorContinuousTestBase.device_type()}:{self.rank}"
+
+    def build_device_mesh(self, mesh_shape=None) -> DeviceMesh:
+        if mesh_shape is None:
+            mesh_shape = (2, self.world_size // 2)
+        return init_device_mesh(DTensorContinuousTestBase.device_type(), mesh_shape)
+
+    def test_neither_placements_nor_shard_order(self):
+        """Test that neither placements nor shard_order, use default"""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        input_tensor_dt = distribute_tensor(input_tensor, mesh)
+        self.assertEqual(
+            input_tensor_dt.placements, [Replicate() for _ in range(mesh.ndim)]
+        )
+        self.assertEqual(input_tensor_dt.shard_order, ())
+        input_tensor_dt.redistribute(mesh, (Shard(0), Shard(0)))
+        input_tensor_dt.redistribute(mesh)
+        self.assertEqual(
+            input_tensor_dt.placements, [Replicate() for _ in range(mesh.ndim)]
+        )
+        self.assertEqual(input_tensor_dt.shard_order, ())
+
+    @parametrize(
+        "placements, shard_order_dict, should_pass",
+        [
+            [(Shard(0), Shard(0)), {0: [0], 1: [1]}, False],
+            [(Shard(0), Shard(0)), {0: [0]}, False],
+            [(Shard(0), Shard(0)), {0: [0, 1]}, True],
+            [(Shard(0), Shard(0)), {0: [1, 0]}, True],
+            [(Shard(1), Shard(0)), {0: [1], 1: [0]}, True],
+            [(Shard(1), Shard(0)), {0: [0], 1: [1]}, False],
+            [(Shard(1), Shard(2)), {1: [0], 2: [1]}, True],
+            [(Replicate(), Shard(2)), {2: [1]}, True],
+            [(Replicate(), Replicate()), {}, True],
+        ],
+    )
+    def test_conflict_placements_and_shard_order(
+        self, placements, shard_order_dict, should_pass
+    ):
+        """Test that providing conflict placements and shard_order raises an error."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        test_context = (
+            contextlib.nullcontext()
+            if should_pass
+            else self.assertRaisesRegex(
+                AssertionError,
+                "Conflict sharding annotation",
+            )
+        )
+        with test_context:
+            distribute_tensor(
+                input_tensor, mesh, placements=placements, shard_order=shard_order_dict
+            )
+
+    @parametrize(
+        "placements, expected_shard_order_tuple",
+        [
+            [(Shard(0), Shard(1)), ((0, 0), (1, 1))],
+            [(Shard(0), Shard(0)), ((0, 0, 1),)],
+            [(Shard(1), Shard(2)), ((1, 0), (2, 1))],
+            [(Replicate(), Shard(2)), ((2, 1),)],
+            [(Replicate(), Replicate()), ()],
+        ],
+    )
+    def test_only_placements_provided(self, placements, expected_shard_order_tuple):
+        """Test that providing only placements works correctly."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        input_tensor_dt = distribute_tensor(input_tensor, mesh, placements)
+        self.assertEqual(input_tensor_dt.placements, tuple(placements))
+        self.assertEqual(input_tensor_dt.full_tensor(), input_tensor)
+        self.assertEqual(input_tensor_dt.shard_order, expected_shard_order_tuple)
+
+    @parametrize(
+        "expected_placements, shard_order_dict",
+        [
+            [(Shard(0), Shard(1)), {0: [0], 1: [1]}],
+            [(Shard(0), Shard(0)), {0: [0, 1]}],
+            [(Shard(0), Shard(0)), {0: [1, 0]}],
+            [(Shard(1), Shard(2)), {1: [0], 2: [1]}],
+            [(Replicate(), Shard(2)), {2: [1]}],
+            [(Replicate(), Replicate()), {}],
+        ],
+    )
+    def test_only_shard_order_provided(self, expected_placements, shard_order_dict):
+        """Test that providing only shard_order works correctly."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        input_tensor_dt = distribute_tensor(
+            input_tensor, mesh, shard_order=shard_order_dict
+        )
+        self.assertEqual(input_tensor_dt.placements, expected_placements)
+        self.assertEqual(input_tensor_dt.full_tensor(), input_tensor)
+
+    @parametrize(
+        "placements, shard_order_dict, should_pass",
+        [
+            [(Shard(0), Shard(0)), {0: [1, 0]}, True],
+            [None, {0: [1], 1: [0]}, True],
+            [(Shard(1), Shard(2)), {1: [0], 2: [2]}, False],
+            [(Shard(1), Shard(2)), {1: [0], 2: [-1]}, False],
+            [(Shard(1), Shard(2)), {1: [0], -1: [1]}, True],
+            [None, {1: [0, 1]}, True],
+            [None, {1: [1, -3]}, False],
+        ],
+    )
+    def test_out_of_range_shard_order(self, placements, shard_order_dict, should_pass):
+        """Test that providing only shard_order works correctly."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        test_context = (
+            contextlib.nullcontext()
+            if should_pass
+            else self.assertRaisesRegex(
+                IndexError,
+                "`shard_order` is out of range for placements",
+            )
+        )
+        with test_context:
+            distribute_tensor(
+                input_tensor, mesh, placements=placements, shard_order=shard_order_dict
+            )
+
+    def test_empty_shard_order_creates_replicated_dtensor(self):
+        """Test that empty shard_order creates a replicated DTensor."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        empty_shard_order = {}
+
+        dt_empty_shard_order = distribute_tensor(
+            input_tensor, mesh, shard_order=empty_shard_order
+        )
+        expected_default_placements = (Replicate(), Replicate())
+        self.assertEqual(dt_empty_shard_order.placements, expected_default_placements)
+        self.assertEqual(dt_empty_shard_order.full_tensor(), input_tensor)
+
+    @parametrize(
+        "placements, expected_shard_order_tuple",
+        [
+            [(Shard(0), Shard(1)), ((0, 0), (1, 1))],
+            [(Shard(0), Shard(0)), ((0, 0, 1),)],
+            [(Shard(1), Shard(2)), ((1, 0), (2, 1))],
+            [(Replicate(), Shard(2)), ((2, 1),)],
+            [(Replicate(), Replicate()), ()],
+        ],
+    )
+    def test_redistribute_with_placements_only(
+        self, placements, expected_shard_order_tuple
+    ):
+        """Test redistribution using placements only."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        dt_default = distribute_tensor(
+            input_tensor, mesh, placements=(Replicate(), Replicate())
+        )
+        dt_redist_placements = dt_default.redistribute(mesh, placements)
+        self.assertEqual(dt_redist_placements.placements, placements)
+        self.assertEqual(dt_redist_placements.full_tensor(), input_tensor)
+        self.assertEqual(dt_redist_placements.shard_order, expected_shard_order_tuple)
+
+    @parametrize(
+        "expected_placements, shard_order_dict",
+        [
+            [(Shard(0), Shard(1)), {0: [0], 1: [1]}],
+            [(Shard(0), Shard(0)), {0: [0, 1]}],
+            [(Shard(0), Shard(0)), {0: [1, 0]}],
+            [(Shard(1), Shard(2)), {1: [0], 2: [1]}],
+            [(Replicate(), Shard(2)), {2: [1]}],
+            [(Replicate(), Replicate()), {}],
+        ],
+    )
+    def test_redistribute_with_shard_order_only(
+        self, expected_placements, shard_order_dict
+    ):
+        """Test redistribution using shard_order only."""
+        mesh = self.build_device_mesh((2, self.world_size // 2))
+        input_tensor = torch.randn(8, 6, 5, device=self.device)
+        dt_default = distribute_tensor(
+            input_tensor, mesh, placements=(Replicate(), Replicate())
+        )
+        dt_redist_shard_order = dt_default.redistribute(
+            mesh, shard_order=shard_order_dict
+        )
+        self.assertEqual(dt_redist_shard_order.placements, expected_placements)
+        self.assertEqual(dt_redist_shard_order.full_tensor(), input_tensor)
+
+
+instantiate_parametrized_tests(DTensorDeviceOrderAPITest)
 
 
 if __name__ == "__main__":
