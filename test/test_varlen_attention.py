@@ -66,7 +66,7 @@ class AttentionBlock(nn.Module):
         v = v.view(-1, self.num_heads, self.head_dim)
 
         attn_out = varlen_attn(
-            q, k, v, cu_seq, cu_seq, max_len, max_len, is_causal=is_causal
+            q, k, v, cu_seq, cu_seq, max_len, max_len, is_causal
         )
         attn_out = attn_out.view(-1, self.embed_dim)
 
@@ -81,6 +81,11 @@ class AttentionBlock(nn.Module):
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # device = x_padded.device
+        # mask = torch.arange(seq_len, device=device).unsqueeze(0) >= seq_lengths.unsqueeze(1)
+        # attn_mask = mask[:, None, None, :]
+        # attn_mask = attn_mask.to(torch.bool)
 
         attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
         attn_out = (
@@ -103,7 +108,7 @@ def create_variable_length_batch(
     seq_lengths = torch.tensor(seq_lengths, device=device)
     total_tokens = seq_lengths.sum().item()
 
-    x_packed = torch.randn(total_tokens, shape.embed_dim, device=device, dtype=dtype)
+    x_packed = torch.randn(total_tokens, shape.embed_dim, device=device, dtype=dtype, requires_grad=True)
 
     cu_seq = torch.zeros(shape.batch_size + 1, device=device, dtype=torch.int32)
     cu_seq[1:] = seq_lengths.cumsum(0)
@@ -118,6 +123,7 @@ def create_variable_length_batch(
         end_idx = start_idx + seq_len
         x_padded[i, :seq_len] = x_packed[start_idx:end_idx]
         start_idx = end_idx
+    x_padded = x_padded.clone().detach().requires_grad_()
 
     return {
         "seq_lengths": seq_lengths,
@@ -145,7 +151,7 @@ class TestVarlenAttention(NNTestCase):
 
         total_tokens = shape.batch_size * shape.max_seq_len
         x_packed = torch.randn(
-            total_tokens, shape.embed_dim, device=device, dtype=dtype
+            total_tokens, shape.embed_dim, device=device, dtype=dtype, requires_grad=True
         )
         cu_seq = torch.tensor(
             [0, shape.max_seq_len, total_tokens], device=device, dtype=torch.int32
@@ -158,6 +164,13 @@ class TestVarlenAttention(NNTestCase):
         self.assertEqual(output.shape, (total_tokens, shape.embed_dim))
         self.assertEqual(output.device, torch.device(device))
         self.assertEqual(output.dtype, dtype)
+
+        loss = output.sum()
+        loss.backward()
+
+        self.assertIsNotNone(x_packed.grad)
+        self.assertEqual(x_packed.grad.shape, x_packed.shape)
+        self.assertEqual(x_packed.grad.dtype, x_packed.dtype)
 
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_FLASH_ATTENTION, "Flash Attention not supported"
@@ -217,14 +230,17 @@ class TestVarlenAttention(NNTestCase):
 
         variable_length_batch_data = create_variable_length_batch(shape, device, dtype)
 
+        x_packed = variable_length_batch_data["x_packed"]
+        x_padded = variable_length_batch_data["x_padded"]
+
         varlen_output = attention_block.forward_varlen(
-            variable_length_batch_data["x_packed"],
+            x_packed,
             variable_length_batch_data["cu_seq"],
             variable_length_batch_data["max_len"],
             is_causal=is_causal,
         )
         sdpa_output = attention_block.forward_sdpa(
-            variable_length_batch_data["x_padded"], is_causal=is_causal
+            x_padded, is_causal=is_causal
         )
 
         tolerances = default_tolerances[dtype]
@@ -234,9 +250,37 @@ class TestVarlenAttention(NNTestCase):
 
             varlen_seq = varlen_output[start_idx:end_idx]
             sdpa_seq = sdpa_output[i, :seq_len]
-
+            print(f"varlen_seq: {varlen_seq}")
+            print(f"sdpa_seq: {sdpa_seq}")
             torch.testing.assert_close(varlen_seq, sdpa_seq, **tolerances)
             start_idx = end_idx
+
+        varlen_loss = varlen_output.sum()
+        # sdpa_loss = sdpa_output.sum()
+
+        sdpa_loss = 0
+        for i, seq_len in enumerate(variable_length_batch_data["seq_lengths"]):
+            sdpa_loss = sdpa_loss + sdpa_output[i, :seq_len].sum()
+
+        print(f"varlen_loss: {varlen_loss}")
+        print(f"sdpa_loss: {sdpa_loss}")
+
+        torch.testing.assert_close(varlen_loss, sdpa_loss, **tolerances)
+
+        varlen_loss.backward()
+        sdpa_loss.backward()
+
+        start_idx = 0
+        for i, seq_len in enumerate(variable_length_batch_data["seq_lengths"]):
+            end_idx = start_idx + seq_len
+            varlen_grad_seq = x_packed.grad[start_idx:end_idx]
+            sdpa_grad_seq = x_padded.grad[i, :seq_len]
+            # print(f"varlen_grad_seq: {varlen_grad_seq}")
+            # print(f"sdpa_grad_seq: {sdpa_grad_seq}")
+            torch.testing.assert_close(varlen_grad_seq, sdpa_grad_seq, **tolerances)
+            start_idx = end_idx
+
+
 
 
 device_types = ("cuda",)
